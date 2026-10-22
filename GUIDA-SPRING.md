@@ -53,3 +53,21 @@ Non è possibile garantire una conversione completa per tutte le classi Java o p
 Vedere `COPERTURA.md` per i casi coperti e i limiti, e `VERIFICA.md` per gli esiti effettivi dei test. I cicli usano `$ref`; dati esclusi, errori o limiti sono segnalati esplicitamente. Restano attivi l'oscuramento dei nomi sensibili e i limiti sulle esportazioni.
 
 Per compilare serve **JDK 21**. Il plugin dichiara **IntelliJ IDEA 2025.1+**; la versione effettivamente verificata è specificata in `VERIFICA.md`. Non serve il plugin Spring a pagamento di IntelliJ.
+
+## Errore di build `27.0.1` su Windows
+
+Questo errore, con `JavaVersion.parse` nello stack trace, indica che Gradle sta valutando gli script Kotlin con Java 27. Per questa versione del progetto usare **JDK 21**. La versione target dei sorgenti non seleziona la JVM con cui Gradle viene avviato.
+
+Il repository vincola il daemon a JDK 21 con `ExportJson/gradle/gradle-daemon-jvm.properties`. JDK 21 deve essere installato localmente; il progetto non configura il suo download automatico.
+
+Da PowerShell nella cartella `ExportJson`, sostituire il percorso d'esempio con la propria installazione di JDK 21:
+
+```powershell
+$env:JAVA_HOME = 'C:\percorso\del\jdk-21'
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+.\gradlew.bat --stop
+.\gradlew.bat --version
+.\gradlew.bat clean build --stacktrace
+```
+
+`JAVA_HOME` deve indicare la cartella che contiene `bin\java.exe`. Controllare che `--version` riporti Java 21 per launcher e daemon. In IntelliJ selezionare anche JDK 21 come **Gradle JVM** nelle impostazioni Gradle. Per risolvere questo errore non serve cancellare le cache o modificare le opzioni di accesso nativo.

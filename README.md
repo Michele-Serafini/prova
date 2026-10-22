@@ -40,7 +40,23 @@ Spring libraries are **test-only dependencies**. No Spring library or paid Intel
 
 ## Build and validation
 
-From `ExportJson/`, with JDK 21:
+From `ExportJson/`, with **an installed JDK 21**. `gradle/gradle-daemon-jvm.properties` pins the Gradle daemon to Java 21. It can discover a locally installed JDK; automatic JDK downloading is not configured.
+
+If Gradle fails before compilation with `IllegalArgumentException: 27.0.1` in `org.jetbrains.kotlin...JavaVersion.parse`, it was evaluating Kotlin build scripts with Java 27. This wrapper uses Gradle 8.14.3 and its embedded Kotlin; use JDK 21 for the build launcher as well as the daemon. `sourceCompatibility = 21` alone does not choose the JVM that runs Gradle.
+
+In **PowerShell**, replace the example below with your actual JDK 21 installation directory (the directory containing `bin/java.exe`, not `bin` itself):
+
+```powershell
+$env:JAVA_HOME = 'C:\percorso\del\jdk-21'
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+.\gradlew.bat --stop
+.\gradlew.bat --version
+.\gradlew.bat clean build --stacktrace
+```
+
+Check that the launcher and daemon report Java 21. When building from IntelliJ, set **Settings → Build, Execution, Deployment → Build Tools → Gradle → Gradle JVM** to JDK 21. Gradle's daemon criteria take precedence when present. The plugin's build JDK is separate from the JDK used by the application being debugged.
+
+Standard commands:
 
 ```bat
 .\gradlew.bat clean build

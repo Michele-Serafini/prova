@@ -58,3 +58,11 @@ SHA-256 dello ZIP installabile:
 ```text
 c7755f91790ccd658e2a923361d31ee5acf2955e5eb25458b166c5bac7a71f39
 ```
+
+## Correzione della selezione JDK per Gradle
+
+Il log Windows successivo alla prima pubblicazione mostra `IllegalArgumentException: 27.0.1` in `org.jetbrains.kotlin...JavaVersion.parse`, durante la valutazione degli script Kotlin e prima della compilazione del plugin. Il daemon era quindi avviato con Java 27, mentre questa build richiede JDK 21.
+
+Aggiunto `ExportJson/gradle/gradle-daemon-jvm.properties` con `toolchainVersion=21`, senza percorsi legati a un PC né un vendor obbligatorio. JDK 21 deve essere installato localmente; non è configurato il download automatico di JDK. README e guida contengono i comandi PowerShell per selezionare JDK 21 anche nel launcher.
+
+Verifica mirata della correzione: `gradle --version` riconosce il criterio Java 21; `gradle --offline --no-daemon help` termina con **BUILD SUCCESSFUL** e il log del daemon conferma `javaVersion=21`. Non sono stati modificati sorgenti o test del plugin e non è stata rieseguita la suite completa per questa modifica di avvio. Il problema Windows è stato diagnosticato dal log fornito; la verifica locale è avvenuta su Linux/JDK 21.
