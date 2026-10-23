@@ -46,6 +46,12 @@ Puoi anche selezionare il nome di una classe componente Spring, ad esempio una c
 
 Non chiama `getBean()`, `getObject()`, getter, `toString()` o serializer Jackson. Non inizializza bean lazy, prototype o scoped. I target proxy non leggibili senza eseguire codice sono indicati con `$skipped`.
 
+## Impostazioni e prestazioni
+
+Aprire **Settings → Tools → Runtime Object to JSON**. La scheda **Spring beans** permette di impostare i budget dell'esportazione Spring; **Ordinary values** mantiene valori indipendenti per gli altri oggetti. **Spring lookup** regola ricerca dei contesti, cache, profondità proxy e salti alias. Le modifiche si applicano con **Apply** dall'esportazione successiva e restano salvate dopo il riavvio. **Restore Defaults** ripristina i valori iniziali nel modulo; premere Apply per salvarli.
+
+Ridurre elementi, profondità e valori visitati limita il lavoro del debugger. Aumentarli permette snapshot più ampi ma può richiedere più tempo e memoria. Le letture raggruppate e le cache della versione 1.5 sono descritte con misure riproducibili in **README-OTTIMIZZAZIONI.md**.
+
 ## Copertura e limiti
 
 Non è possibile garantire una conversione completa per tutte le classi Java o per ogni estensione Spring. Il JSON rappresenta i campi reali in memoria e può differire dal JSON delle API REST dell'applicazione. Strutture JDK note ricevono una rappresentazione leggibile; layout sconosciuti e risorse come thread, connessioni, stream o stato nativo non equivalgono a normali dati JSON.

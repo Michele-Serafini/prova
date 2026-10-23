@@ -2,14 +2,20 @@ package pluginjson.scanner;
 
 import com.sun.jdi.*;
 import java.util.List;
+import pluginjson.settings.SpringLookupLimits;
 
 /** Reads the selected instance before considering a Spring context lookup. */
 public final class RuntimeValueResolver {
-  private final SpringBeanLocator spring = new SpringBeanLocator();
+  private final SpringBeanLocator spring;
+
+  public RuntimeValueResolver() { this(SpringLookupLimits.defaults()); }
+
+  public RuntimeValueResolver(SpringLookupLimits limits) { spring = new SpringBeanLocator(limits); }
   public record ResolvedValue(Value value, boolean springMode) {}
 
   public ResolvedValue resolve(StackFrame frame, ExportTarget target) throws Exception {
     VirtualMachine vm = frame.virtualMachine();
+    SpringBeanLocator.Lookup spring = this.spring.newLookup();
     if (target.kind() == ExportTarget.Kind.BEAN) {
       return new ResolvedValue(spring.findBean(vm, target.beanName()), true);
     }
@@ -20,7 +26,8 @@ public final class RuntimeValueResolver {
     if (target.kind() == ExportTarget.Kind.LOCAL) {
       read = local(frame, target.name());
     } else if (target.kind() == ExportTarget.Kind.THIS) {
-      read = new ReadResult(frame.thisObject() != null, frame.thisObject());
+      ObjectReference current = frame.thisObject();
+      read = new ReadResult(current != null, current);
     } else {
       read = field(frame, target.fieldPath());
     }

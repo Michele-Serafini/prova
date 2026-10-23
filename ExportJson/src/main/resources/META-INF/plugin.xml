@@ -24,6 +24,13 @@
   <depends>com.intellij.modules.platform</depends>
   <depends>com.intellij.modules.java</depends>
 
+  <extensions defaultExtensionNs="com.intellij">
+    <applicationConfigurable id="runtimeobjecttojson.settings"
+                            parentId="tools"
+                            displayName="Runtime Object to JSON"
+                            instance="pluginjson.settings.ExportSettingsConfigurable"/>
+  </extensions>
+
   <actions>
 
     <action

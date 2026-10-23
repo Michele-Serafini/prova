@@ -1,68 +1,79 @@
-# Verifica della versione 1.4.0
+# Verifica della versione 1.5.0
 
-Controlli completati il **22 ottobre 2026**.
+Controlli completati il **23 ottobre 2026**.
 
 | Controllo | Esito |
 | --- | --- |
-| `clean build` | PASS, compilazione e test da cartella build eliminata |
-| `buildPlugin` | PASS — `PluginJson-1.4.0.zip` |
+| `clean build` | PASS, directory build ricreata e suite eseguita |
+| `buildPlugin` | PASS — `PluginJson-1.5.0.zip` |
 | `verifyPluginProjectConfiguration` | PASS |
 | `verifyPluginStructure` | PASS |
+| `buildSearchableOptions` / `jarSearchableOptions` | PASS, indice della nuova pagina delle impostazioni incluso |
 | IntelliJ Plugin Verifier 1.411 | **Compatible** |
 | IDE verificato | IntelliJ IDEA Community 2025.1.4.1, IC-251.27812.49 |
-| Suite Gradle | **5 test, 0 fallimenti, 0 errori, 0 saltati** |
-| Azioni registrate | Una sola: **Export Object to JSON** |
+| Suite Gradle | **16 test in 8 classi, 0 fallimenti, 0 errori, 0 saltati** |
+| Benchmark su JVM JDI reali | PASS, 4 JSON identici al riferimento e 2 ricerche Spring corrette |
+| `git diff --check` | PASS |
 
-Comando finale completato con successo dalla cartella `ExportJson/`:
+Comando completo eseguito dalla cartella `ExportJson/`:
 
 ```text
 gradle clean build buildPlugin verifyPluginProjectConfiguration verifyPluginStructure verifyPlugin
 ```
 
-Su Windows si usa il wrapper incluso, ad esempio `.\gradlew.bat clean build buildPlugin verifyPluginProjectConfiguration verifyPluginStructure verifyPlugin`.
+Su Windows usare il wrapper incluso con JDK 21: `.\gradlew.bat clean build buildPlugin verifyPluginProjectConfiguration verifyPluginStructure verifyPlugin`.
 
 ## Test eseguiti
 
-- `EditorExportTargetResolverTest`: PASS (4.15 s).
-- `JavaTypesIntegrationTest`: PASS (3.187 s).
-- `RuntimeScannerServiceTest`: PASS (3.889 s).
-- `RuntimeValueResolverTest`: PASS (0.581 s).
-- `SpringBeanLocatorTest`: PASS (40.616 s).
+| Classe | Test | Esito |
+| --- | ---: | --- |
+| EditorExportTargetResolverTest | 1 | PASS |
+| JavaTypesIntegrationTest | 1 | PASS |
+| JsonExporterServiceTest | 1 | PASS |
+| RuntimeScannerPerformanceTest | 6 | PASS |
+| RuntimeScannerServiceTest | 1 | PASS |
+| RuntimeValueResolverTest | 1 | PASS |
+| SpringBeanLocatorTest | 1 | PASS |
+| ExportSettingsTest | 4 | PASS |
 
-Le suite JDI avviano vere JVM separate, si fermano a breakpoint e controllano i valori effettivi senza simulare gli oggetti JDI:
+Le suite JDI avviano vere JVM separate, sospese su breakpoint. Controllano tipi Java, layout JDK, riferimenti/cicli, null, redazione, campi nascosti, ricevitori effettivi, Spring Boot 3.4.5 / Spring Framework 6.2.6, FactoryBean, proxy e ambiguità. I contatori nelle fixture verificano che non venga eseguito codice applicativo per esportare i dati.
 
-- `RuntimeScannerServiceTest`: regressioni della serializzazione originale, tipi standard, contenitori, riferimenti, limiti e oscuramento dei nomi sensibili.
-- `JavaTypesIntegrationTest`: tutti gli array primitivi, valori limite/precisione numerica, record/POJO, enum e collezioni/mappe concorrenti, tabelle sparse, subList con grandi offset, wrapper ciclici, Unicode, cache temporali incoerenti, layout sconosciuti e campi JDK nascosti da sottoclassi.
-- `RuntimeValueResolverTest`: variabili/campi omonimi, campi privati ereditati/nascosti, ricevitore effettivo, catene di campi, campi statici anche in frame statici, conservazione dei null e selezioni non accessibili.
-- `SpringBeanLocatorTest`: applicazione Spring Boot 3.4.5 / Spring Framework 6.2.6, bean/alias/tipi, risoluzione automatica, null, qualifier, FactoryBean e prodotti cache, proxy annidati/frozen/opaque/statici, array, contesti custom/chiusi, cache sparse, campi Spring nascosti e ambiguità. I contatori delle sorgenti proxy controllano che l'export non invochi il codice applicativo.
-- `EditorExportTargetResolverTest`: parser e risoluzione simboli Java PSI reali dell'SDK IntelliJ, nomi costanti `@Bean`, FactoryBean automatico, qualifier, nomi binari annidati, campo vs locale, catene di campi, statici e componenti Spring.
+Le nuove verifiche comprendono:
 
-Le prove sono state eseguite anche separatamente durante l'analisi. La build finale conferma l'esecuzione con il runner Gradle e le estensioni JUnit automatiche dell'SDK IntelliJ.
+- Budget deterministici delle chiamate JDI per POJO, mappe sparse e BigInteger; nessuna lettura dei campi sensibili o sintetici; arresto delle letture al budget; rispetto dei limiti delle stringhe scalari; cache azzerate tra snapshot. Questi sei test usano mirror JDI controllati per contare precisamente le chiamate, affiancati alle suite e ai benchmark con vere JVM.
+- Persistenza delle impostazioni tramite serializer XML IntelliJ, ripristino dei soli campi invalidi, limiti ammessi, Apply/Reset Swing e rifiuto atomico di valori invalidi o frazionari. La pagina viene anche istanziata dall'IDE durante la generazione dell'indice delle impostazioni.
+- Dodici scritture concorrenti di JSON Unicode con null, percorsi univoci e contenuti verificati.
+- Tutti e cinque i limiti della ricerca Spring, confine dei salti alias e riuso del locator dopo ripresa della JVM con sostituzione dei contesti.
 
-## Miglioramenti verificati
+## Prestazioni
 
-La revisione ha corretto perdita di elementi in set immutabili sparsi, offset di subList, chiavi null/duplicate a identità, booleani atomici esportati come interi, riferimenti ai payload Optional/AtomicReference, false letture da campi omonimi, cache Spring sparse e selezioni di oggetti errate per omonimia. Sono stati aggiunti budget di testo/valori e lettori per ulteriori tipi Java. Le ricerche Spring incomplete o ambigue non vengono trasformate in scelte arbitrarie.
+Il confronto con il commit `5b80db2` è riproducibile mediante **[ExportJson/tools/benchmark/run.py](ExportJson/tools/benchmark/run.py)**. Il rapporto **[RESULTS-2026-10-23.txt](ExportJson/tools/benchmark/RESULTS-2026-10-23.txt)** conserva versioni, metodo, hash dei sorgenti misurati, hash dei JSON, tempi e conteggi JDWP effettivi.
 
-La generazione degli indici delle impostazioni è disabilitata con l'opzione Gradle corretta per l'intera pipeline, perché il plugin espone azioni nell'editor. La build pulita ha verificato che nessuna task richieda una vecchia cartella generata. I file JSON vengono riservati atomicamente con nomi univoci per evitare sovrascritture tra esportazioni simultanee.
+| Fixture | Richieste prima | Richieste dopo | Riduzione |
+| --- | ---: | ---: | ---: |
+| 500 POJO, 12 campi | 6.002 | 502 | 91,64% |
+| 20 POJO, 96 campi | 1.921 | 21 | 98,91% |
+| HashMap, 16.384 bucket sparsi | 16.389 | 67 | 99,59% |
+| BigInteger, 1.024 parole | 1.026 | 5 | 99,51% |
+| Ricerca Spring per tipo, 500 singleton | 1.029 | 519 | 49,56% |
+| Riconoscimento Spring per identità | 1.029 | 43 | 95,82% |
 
-## Limiti della verifica
+Le latenze sono mediane di cinque scansioni dopo riscaldamento, senza avvio JVM, rendering JSON o tracing. Il sistema era condiviso con la pipeline Gradle: la ricerca Spring per tipo misura 86,768 → 94,336 ms nell'esecuzione registrata, mentre gli altri casi migliorano. I conteggi JDWP sono rimasti invariati tra le esecuzioni. Questi risultati non dimostrano una velocità universale su ogni oggetto o debugger remoto.
 
-Compilazione con JDK 21 e test Gradle con JBR 21 dell'SDK IntelliJ. Spring è usato esclusivamente nei test; lo ZIP distribuito non contiene librerie Spring o JUnit. Il certificato/proxy necessari nell'ambiente cloud sono stati forniti ai processi di build senza inserire percorsi dell'ambiente nel progetto.
+## Ambiente e pacchetto
 
-La compatibilità dichiarata parte da IDEA 2025.1; il controllo binario riguarda la versione riportata sopra, non tutte le versioni future. Non è stata eseguita una prova manuale interattiva nel progetto dell'utente. I test PSI verificano i simboli e il manifest verifica l'unica voce di menu; non sostituiscono una prova manuale completa dell'interfaccia.
+Build con Temurin JDK 21.0.8+9 e Gradle 8.14.3; test con JBR 21 dell'SDK IntelliJ. Il criterio Gradle continua a richiedere JDK 21 anche per il daemon. Nell'ambiente cloud, proxy, trust store, preferenze e cache scrivibili dei processi IDE/verifier sono stati configurati con uno script di inizializzazione esterno; nessun percorso dell'ambiente è necessario per compilare il progetto su un normale PC.
 
-Nessun test può dimostrare la conversione universale di ogni classe Java, layout JDK, estensione Spring o stato concorrente. `COPERTURA.md` descrive i casi supportati e quelli esclusi; non vengono applicati getter, Jackson, regole ORM o tutte le regole di selezione DI di Spring.
+Lo ZIP contiene il JAR del plugin, Gson, le annotazioni necessarie e l'indice delle impostazioni. **Nessuna libreria Spring o JUnit è distribuita.** Le impostazioni sono persistenti a livello applicazione e i profili immutabili vengono acquisiti prima dell'esportazione.
 
-SHA-256 dello ZIP installabile:
+SHA-256 dello ZIP verificato:
 
 ```text
-c7755f91790ccd658e2a923361d31ee5acf2955e5eb25458b166c5bac7a71f39
+835aa10c10acb2126ab878e59c2cd6d046411cda0bad67729f27c99dc6e65f3c
 ```
 
-## Correzione della selezione JDK per Gradle
+## Ambito della verifica
 
-Il log Windows successivo alla prima pubblicazione mostra `IllegalArgumentException: 27.0.1` in `org.jetbrains.kotlin...JavaVersion.parse`, durante la valutazione degli script Kotlin e prima della compilazione del plugin. Il daemon era quindi avviato con Java 27, mentre questa build richiede JDK 21.
+Compatibilità binaria verificata con l'IDE indicato, non con tutte le versioni future. I test Swing e l'indicizzazione verificano la pagina delle impostazioni; non è stata eseguita una prova manuale completa nel progetto dell'utente. La lettura di oggetti modificati da thread non sospesi può produrre snapshot incoerenti. **[COPERTURA.md](COPERTURA.md)** descrive layout supportati e marcatori; **[README-OTTIMIZZAZIONI.md](README-OTTIMIZZAZIONI.md)** riepiloga modifiche e impostazioni.
 
-Aggiunto `ExportJson/gradle/gradle-daemon-jvm.properties` con `toolchainVersion=21`, senza percorsi legati a un PC né un vendor obbligatorio. JDK 21 deve essere installato localmente; non è configurato il download automatico di JDK. README e guida contengono i comandi PowerShell per selezionare JDK 21 anche nel launcher.
-
-Verifica mirata della correzione: `gradle --version` riconosce il criterio Java 21; `gradle --offline --no-daemon help` termina con **BUILD SUCCESSFUL** e il log del daemon conferma `javaVersion=21`. Non sono stati modificati sorgenti o test del plugin e non è stata rieseguita la suite completa per questa modifica di avvio. Il problema Windows è stato diagnosticato dal log fornito; la verifica locale è avvenuta su Linux/JDK 21.
+La precedente verifica 1.4.0 e la correzione del launcher Windows Java 27 rimangono disponibili nella storia Git al commit `5b80db2`. La selezione JDK 21 e le istruzioni PowerShell restano nel README e nella guida.

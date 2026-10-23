@@ -14,6 +14,9 @@ import com.intellij.openapi.ui.Messages;
 import com.intellij.psi.PsiJavaFile;
 import org.jetbrains.annotations.NotNull;
 import pluginjson.scanner.*;
+import pluginjson.settings.ExportSettings;
+import pluginjson.settings.ScanLimits;
+import pluginjson.settings.SpringLookupLimits;
 
 /** One editor command for runtime variables, fields and Spring-managed objects. */
 public final class ExportRuntimeFromEditorAction extends AnAction {
@@ -44,13 +47,20 @@ public final class ExportRuntimeFromEditorAction extends AnAction {
       warning(project, "Il debugger deve essere fermo su un breakpoint con un frame selezionato.");
       return;
     }
+    // Capture immutable settings once; Apply affects the next export, never a
+    // traversal already in progress on the debugger manager thread.
+    ExportSettings settings = ExportSettings.getInstance();
+    ScanLimits ordinaryLimits = settings.getLimits(false);
+    ScanLimits springLimits = settings.getLimits(true);
+    SpringLookupLimits lookupLimits = settings.getLookupLimits();
     session.getProcess().getManagerThread().invokeCommand(new DebuggerCommand() {
       @Override
       public void action() {
         try {
           RuntimeValueResolver.ResolvedValue resolved =
-              new RuntimeValueResolver().resolve(frame.getStackFrame(), target);
-          JsonElement json = new RuntimeScannerService(resolved.springMode()).scanValue(resolved.value());
+              new RuntimeValueResolver(lookupLimits).resolve(frame.getStackFrame(), target);
+          JsonElement json = new RuntimeScannerService(resolved.springMode() ? springLimits : ordinaryLimits)
+              .scanValue(resolved.value());
           new JsonExporterService().write(project, target.name(), json);
         } catch (Exception error) {
           LOG.warn("Impossibile esportare " + target.name(), error);

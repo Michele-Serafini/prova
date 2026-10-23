@@ -61,7 +61,7 @@ Il JSON non applica getter calcolati, annotazioni Jackson, serializer custom, re
 | Valori visitati | 200.000 | 80.000 |
 | Testo conservato, incluse chiavi/campi/numeri grandi | 5.000.000 caratteri | 2.000.000 caratteri |
 
-Ogni stringa è inoltre limitata a 100.000 caratteri. I budget si azzerano a ogni export. Il budget di testo non è un limite rigoroso dei byte dell'intero file JSON, che contiene anche indentazione e marcatori. I lettori applicano anche limiti alla scansione delle tabelle interne; raggiungerli non deve trasformare una ricerca incompleta in un risultato certo.
+Questi sono i valori predefiniti, modificabili da **Settings → Tools → Runtime Object to JSON** nei due profili indipendenti. Anche il limite per stringa (predefinito 100.000 caratteri) e quello per tabelle sparse/nodi collegati (predefinito 100.000) sono configurabili. Gli array compatti seguono il limite elementi, non quello delle tabelle sparse. La scheda **Spring lookup** espone i limiti delle ricerche: 64 contesti per classe, 100.000 entry, 1.048.576 bucket, 32 livelli proxy e 1.024 salti alias come valori iniziali. I budget si azzerano a ogni export. Il budget di testo non è un limite rigoroso dei byte dell'intero file JSON, che contiene anche indentazione e marcatori. I lettori applicano anche limiti alla scansione delle tabelle interne; raggiungerli non deve trasformare una ricerca incompleta in un risultato certo.
 
 - `$ref`: riferimento a un payload già emesso, con escaping JSON Pointer.
 - `$truncated`: limite raggiunto e dati omessi.

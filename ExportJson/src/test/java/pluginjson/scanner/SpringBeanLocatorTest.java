@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import pluginjson.settings.SpringLookupLimits;
 import static org.junit.jupiter.api.Assertions.*;
 
 /** Uses real Spring Boot, Spring AOP and JDI; no mocked framework classes. */
@@ -22,6 +23,8 @@ public class SpringBeanLocatorTest {
     Process process = vm.process();
     Thread.ofVirtual().start(() -> drain(process.getInputStream()));
     Thread.ofVirtual().start(() -> drain(process.getErrorStream()));
+    SpringBeanLocator locator = new SpringBeanLocator();
+    Value previousPayload = null;
     try {
       for (String type : List.of(SpringBootFixture.class.getName(), SpringBootFixture.PauseHolder.class.getName())) {
         ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
@@ -45,7 +48,6 @@ public class SpringBeanLocatorTest {
               }
             }
           } else if (event instanceof BreakpointEvent stopped) {
-            SpringBeanLocator locator = new SpringBeanLocator();
             if (stopped.location().method().name().equals("pauseSparse")) {
               sparseStops++;
               ReferenceType fixture = vm.classesByName(SpringBootFixture.class.getName()).getFirst();
@@ -53,6 +55,11 @@ public class SpringBeanLocatorTest {
               assertTrue(locator.findBean(vm, name) instanceof ObjectReference,
                   "A bean in a hash bucket beyond 100,000 must not be silently missed");
             } else if (stops++ < 2) {
+              Value currentPayload = locator.findBean(vm, "payload");
+              assertNotEquals(previousPayload, currentPayload,
+                  "A reused locator must read the active context after the JVM resumes");
+              previousPayload = currentPayload;
+              if (stops == 1) assertConfiguredLimits(vm, locator);
               assertExports(locator, vm);
               assertAutomaticResolution(locator, stopped.thread().frame(0));
             } else {
@@ -60,6 +67,13 @@ public class SpringBeanLocatorTest {
               var ambiguity = assertThrows(SpringBeanLocator.BeanLookupException.class,
                   () -> locator.findBeanByType(vm, SpringBootFixture.UniqueSettings.class.getName()));
               assertEquals(SpringBeanLocator.Reason.AMBIGUOUS, ambiguity.reason());
+              SpringLookupLimits defaults = SpringLookupLimits.defaults();
+              var contexts = new SpringBeanLocator(new SpringLookupLimits(
+                  1, defaults.maxMapEntries(), defaults.maxMapBuckets(),
+                  defaults.maxProxyDepth(), defaults.maxAliasDepth()));
+              assertEquals(SpringBeanLocator.Reason.LIMIT_EXCEEDED,
+                  assertThrows(SpringBeanLocator.BeanLookupException.class,
+                      () -> contexts.findBean(vm, "payload")).reason());
             }
           } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
             fail("Fixture JVM terminated before all breakpoints");
@@ -142,6 +156,38 @@ public class SpringBeanLocatorTest {
     expectMissing(locator, vm, "prototypePayload", "non trovato");
     expectMissing(locator, vm, "missing", "non trovato");
     expectMissing(locator, vm, "&payload", "non trovato");
+  }
+
+  private static void assertConfiguredLimits(VirtualMachine vm, SpringBeanLocator locator)
+      throws Exception {
+    SpringLookupLimits defaults = SpringLookupLimits.defaults();
+    var entries = new SpringBeanLocator(new SpringLookupLimits(
+        defaults.maxContextInstancesPerClass(), 1, defaults.maxMapBuckets(),
+        defaults.maxProxyDepth(), defaults.maxAliasDepth()));
+    assertEquals(SpringBeanLocator.Reason.LIMIT_EXCEEDED,
+        assertThrows(SpringBeanLocator.BeanLookupException.class,
+            () -> entries.findBeanByType(vm, SpringBootFixture.UniqueSettings.class.getName())).reason());
+    var buckets = new SpringBeanLocator(new SpringLookupLimits(
+        defaults.maxContextInstancesPerClass(), defaults.maxMapEntries(), 1,
+        defaults.maxProxyDepth(), defaults.maxAliasDepth()));
+    assertEquals(SpringBeanLocator.Reason.LIMIT_EXCEEDED,
+        assertThrows(SpringBeanLocator.BeanLookupException.class,
+            () -> buckets.findBeanByType(vm, SpringBootFixture.UniqueSettings.class.getName())).reason());
+    var aliases = new SpringBeanLocator(new SpringLookupLimits(
+        defaults.maxContextInstancesPerClass(), defaults.maxMapEntries(), defaults.maxMapBuckets(),
+        defaults.maxProxyDepth(), 1));
+    assertEquals(locator.findBean(vm, "payload"), aliases.findBean(vm, "payloadAlias"),
+        "An alias depth of one permits exactly one followed alias");
+    assertEquals(SpringBeanLocator.Reason.LIMIT_EXCEEDED,
+        assertThrows(SpringBeanLocator.BeanLookupException.class,
+            () -> aliases.findBean(vm, "payloadAliasChain")).reason());
+    var proxies = new SpringBeanLocator(new SpringLookupLimits(
+        defaults.maxContextInstancesPerClass(), defaults.maxMapEntries(), defaults.maxMapBuckets(),
+        1, defaults.maxAliasDepth()));
+    Value jdkProxy = locator.findBean(vm, "jdkProxied");
+    assertEquals(SpringBeanLocator.Reason.LIMIT_EXCEEDED,
+        assertThrows(SpringBeanLocator.BeanLookupException.class,
+            () -> proxies.matchesBeanType(jdkProxy, SpringBootFixture.ServiceImpl.class.getName())).reason());
   }
 
   private static void assertAutomaticResolution(SpringBeanLocator locator, StackFrame frame) throws Exception {

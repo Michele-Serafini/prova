@@ -8,12 +8,14 @@ import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.Messages;
 import com.intellij.openapi.vfs.LocalFileSystem;
-import com.intellij.openapi.vfs.VirtualFile;
+import java.io.BufferedWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.regex.Pattern;
 import org.jetbrains.annotations.NotNull;
 
 public class JsonExporterService {
@@ -26,6 +28,7 @@ public class JsonExporterService {
 
   private static final String OUTPUT_DIRECTORY =
       "JSON";
+  private static final Pattern UNSAFE_FILE_NAME = Pattern.compile("[^a-zA-Z0-9._-]");
 
   /*
    * I millisecondi evitano collisioni quando due esportazioni
@@ -97,31 +100,7 @@ public class JsonExporterService {
               OUTPUT_DIRECTORY
           );
 
-      Files.createDirectories(outputFolder);
-
-      String safeFileName =
-          sanitizeFileName(fileName);
-      if (safeFileName.length() > 100) safeFileName = safeFileName.substring(0, 100);
-
-      String timestamp =
-          LocalDateTime.now().format(
-              FILE_TIMESTAMP_FORMAT
-          );
-
-      String jsonContent =
-          GSON.toJson(json);
-
-      // Reserve a unique file atomically: concurrent exports in the same
-      // millisecond must never overwrite another snapshot.
-      Path outputFile = Files.createTempFile(outputFolder,
-          safeFileName + "_" + timestamp + "_", ".json");
-      try {
-        Files.writeString(outputFile, jsonContent, StandardCharsets.UTF_8);
-      } catch (Exception failure) {
-        try { Files.deleteIfExists(outputFile); }
-        catch (Exception cleanupFailure) { failure.addSuppressed(cleanupFailure); }
-        throw failure;
-      }
+      Path outputFile = writeSnapshot(outputFolder, fileName, json);
 
       refreshAndNotify(
           project,
@@ -143,35 +122,36 @@ public class JsonExporterService {
     }
   }
 
+  /** Streams directly to disk without retaining a second, formatted JSON copy. */
+  static Path writeSnapshot(Path outputFolder, String fileName, JsonElement json) throws java.io.IOException {
+    Files.createDirectories(outputFolder);
+    String safeFileName = sanitizeFileName(fileName);
+    if (safeFileName.length() > 100) safeFileName = safeFileName.substring(0, 100);
+    String timestamp = LocalDateTime.now().format(FILE_TIMESTAMP_FORMAT);
+    // Atomically reserve a unique path even for simultaneous exports.
+    Path outputFile = Files.createTempFile(outputFolder, safeFileName + "_" + timestamp + "_", ".json");
+    try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8)) {
+      GSON.toJson(json, writer);
+    } catch (java.io.IOException | RuntimeException failure) {
+      try { Files.deleteIfExists(outputFile); }
+      catch (java.io.IOException cleanupFailure) { failure.addSuppressed(cleanupFailure); }
+      throw failure;
+    }
+    return outputFile;
+  }
+
   private void refreshAndNotify(
       @NotNull Project project,
       @NotNull Path outputFile
   ) {
 
-    /*
-     * Il Virtual File System e i componenti grafici
-     * devono essere aggiornati sul thread UI.
-     */
-    ApplicationManager
-        .getApplication()
-        .invokeLater(() -> {
+    // Refresh asynchronously: synchronous disk refresh on the UI thread can
+    // freeze the IDE for large snapshots or slow/network-mounted projects.
+    LocalFileSystem.getInstance().refreshNioFiles(List.of(outputFile), true, false,
+        () -> ApplicationManager.getApplication().invokeLater(() -> {
 
           if (project.isDisposed()) {
             return;
-          }
-
-          VirtualFile virtualFile =
-              LocalFileSystem
-                  .getInstance()
-                  .refreshAndFindFileByNioFile(
-                      outputFile
-                  );
-
-          if (virtualFile != null) {
-            virtualFile.refresh(
-                false,
-                false
-            );
           }
 
           Messages.showInfoMessage(
@@ -180,7 +160,7 @@ public class JsonExporterService {
                   + outputFile.toAbsolutePath(),
               DIALOG_TITLE
           );
-        });
+        }));
   }
 
   private void showError(
@@ -204,7 +184,7 @@ public class JsonExporterService {
         });
   }
 
-  private String sanitizeFileName(
+  private static String sanitizeFileName(
       @NotNull String fileName
   ) {
 
@@ -213,10 +193,7 @@ public class JsonExporterService {
     }
 
     String sanitized =
-        fileName.replaceAll(
-            "[^a-zA-Z0-9._-]",
-            "_"
-        );
+        UNSAFE_FILE_NAME.matcher(fileName).replaceAll("_");
 
     return sanitized.isBlank()
         ? "Object"

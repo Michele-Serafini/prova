@@ -123,7 +123,10 @@ public final class SpringBootFixture {
     // framework declarations rather than unrelated application state.
     private boolean active = false;
     private Object beanFactory = "not a factory";
-    Store() { super(Config.class); }
+    Store() {
+      super(Config.class);
+      getBeanFactory().registerAlias("payloadAlias", "payloadAliasChain");
+    }
   }
   static ConfigurableApplicationContext boot;
   static Store first;
@@ -135,6 +138,7 @@ public final class SpringBootFixture {
     app.setBannerMode(Banner.Mode.OFF);
     app.setLogStartupInfo(false);
     boot = app.run();
+    boot.getBeanFactory().registerAlias("payloadAlias", "payloadAliasChain");
     boot.getBean("cached"); // Materialize exactly one FactoryBean product.
     Payload bootBean = (Payload) boot.getBean("payload");
     new PauseHolder(bootBean).pauseHere(bootBean, new Payload(), null);

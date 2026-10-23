@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "dev.micheleserafini"
-version = "1.4.0"
+version = "1.5.0"
 
 repositories {
     mavenCentral()
@@ -36,18 +36,15 @@ dependencies {
 }
 
 intellijPlatform {
-    // Editor actions only: disable the entire searchable-options pipeline.
-    buildSearchableOptions.set(false)
     pluginConfiguration {
         ideaVersion {
             sinceBuild = "251"
         }
 
         changeNotes = """
-            One Export Object to JSON action with automatic Spring detection,
-            source-aware runtime field resolution, qualifiers and type lookup.
-            Expanded Java type coverage and strict unsupported-layout markers.
-            Added real JDI regression tests for Java values and Spring Boot.
+            Faster debugger snapshots with batched JDI reads and export-local metadata caches.
+            Configurable object, Spring and lookup limits in Settings / Tools / Runtime Object to JSON.
+            Streaming JSON output, asynchronous file refresh and expanded regression checks.
         """.trimIndent()
     }
 
@@ -63,6 +60,10 @@ intellijPlatform {
 
 tasks.test {
     useJUnitPlatform()
+    // Keep IntelliJ's test listener preferences isolated and usable in CI.
+    val preferences = layout.buildDirectory.dir("tmp/test-preferences")
+    systemProperty("java.util.prefs.userRoot", preferences.get().asFile.absolutePath)
+    doFirst { preferences.get().asFile.mkdirs() }
 }
 
 java {

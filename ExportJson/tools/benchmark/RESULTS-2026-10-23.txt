@@ -1,0 +1,41 @@
+Recorded 2026-10-23 (Europe/Berlin client date).
+Host: managed Linux 6.18.55 x86_64; local JDI socket transport.
+The host was shared with the final Gradle verification pipeline.
+Wall-clock medians vary with system load; protocol request counts are the
+stable comparison. These fixture results are not universal speed guarantees.
+
+Invocation from ExportJson/ (environment-specific paths):
+python3 tools/benchmark/run.py --java-home /workspace/tools/jdk-21.0.8+9 --classpath '/workspace/spring-test-libs/*' --spring
+
+All four scanner JSON comparisons and both Spring identity assertions passed.
+Class metadata was warmed for both implementations in the same suspended VM.
+Each measured export/lookup used a fresh scanner/locator; no cross-export
+plugin cache was reused. Trace collection was separate from timed scans.
+
+Raw successful run:
+openjdk version "21.0.8" 2025-07-15 LTS
+OpenJDK Runtime Environment Temurin-21.0.8+9 (build 21.0.8+9-LTS)
+OpenJDK 64-Bit Server VM Temurin-21.0.8+9 (build 21.0.8+9-LTS, mixed mode, sharing)
+Baseline commit: 5b80db247543c0e4800321e69f9ab26a51f2281c
+Current source: 5b80db247543c0e4800321e69f9ab26a51f2281c (working tree)
+Timing: 2 warmups, median of 5 scans; startup/JSON rendering/tracing excluded.
+JDWP command counts: separate warmed scan; outputs must match exactly.
+Current measured source SHA-256: 16e4baa12fae6522faab006a8ef17461bacd91e83e1b839bafa7fce67a995798
+ROWS chars=38501 sha256=6930374163a49567f173ea52fdeee093a225396f3c2733f72baf1236714cebe1 baseline_ms=204.261 baseline_jdwp=6002 current_ms=16.698 current_jdwp=502 speedup=12.23x command_reduction=91.64%
+  baseline commands={JDWP.ArrayReference.GetValues=2, JDWP.ObjectReference.GetValues=6000}
+  current commands={JDWP.ArrayReference.GetValues=2, JDWP.ObjectReference.GetValues=500}
+WIDE chars=24601 sha256=9d1b9a28358fa434180ea577a2eb75e761d82c31e6a2ecf0c607f99e13b8a321 baseline_ms=76.759 baseline_jdwp=1921 current_ms=3.985 current_jdwp=21 speedup=19.26x command_reduction=98.91%
+  baseline commands={JDWP.ArrayReference.GetValues=1, JDWP.ObjectReference.GetValues=1920}
+  current commands={JDWP.ArrayReference.GetValues=1, JDWP.ObjectReference.GetValues=20}
+SPARSE chars=64 sha256=d5e03f75134021d846c3b8e45cb2fe6f3d096f9b139601021502c800b6ccea23 baseline_ms=446.387 baseline_jdwp=16389 current_ms=3.046 current_jdwp=67 speedup=146.57x command_reduction=99.59%
+  baseline commands={JDWP.ArrayReference.GetValues=16384, JDWP.ObjectReference.GetValues=5}
+  current commands={JDWP.ArrayReference.GetValues=64, JDWP.ObjectReference.GetValues=3}
+INTEGER chars=9855 sha256=db6ec14876b81adad2a163c95e2bd0cc5c140fda4ae7b2ca1aa8dd41b92a5dd0 baseline_ms=56.791 baseline_jdwp=1026 current_ms=3.419 current_jdwp=5 speedup=16.61x command_reduction=99.51%
+  baseline commands={JDWP.ArrayReference.GetValues=1024, JDWP.ObjectReference.GetValues=2}
+  current commands={JDWP.ArrayReference.GetValues=4, JDWP.ObjectReference.GetValues=1}
+SPRING_TYPE_500 baseline_ms=86.768 baseline_jdwp=1029 current_ms=94.336 current_jdwp=519 speedup=0.92x command_reduction=49.56%
+  baseline commands={JDWP.ArrayReference.GetValues=4, JDWP.ObjectReference.GetValues=1023, JDWP.ReferenceType.Instances=2}
+  current commands={JDWP.ArrayReference.GetValues=4, JDWP.ObjectReference.GetValues=513, JDWP.ReferenceType.Instances=2}
+SPRING_IDENTITY_500 baseline_ms=38.742 baseline_jdwp=1029 current_ms=14.630 current_jdwp=43 speedup=2.65x command_reduction=95.82%
+  baseline commands={JDWP.ArrayReference.GetValues=4, JDWP.ObjectReference.GetValues=1023, JDWP.ReferenceType.Instances=2}
+  current commands={JDWP.ArrayReference.GetValues=2, JDWP.ObjectReference.GetValues=39, JDWP.ReferenceType.Instances=2}

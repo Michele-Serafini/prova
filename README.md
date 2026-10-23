@@ -1,6 +1,12 @@
-# Runtime Object to JSON — 1.4.0
+# Runtime Object to JSON — 1.5.0
 
 One IntelliJ editor command, **Export Object to JSON**, exports real Java values from a suspended JVM to formatted files in `<project>/JSON/`. The command also recognizes Spring Boot beans automatically. Building the plugin requires JDK 21; the minimum IDE build is IntelliJ IDEA 2025.1 (251).
+
+## Faster snapshots and configurable limits
+
+Version 1.5 batches debugger field/array reads, caches type metadata within each export, stops traversal when visit budgets are exhausted, streams formatted JSON to disk, and refreshes the IDE file system asynchronously. Real-JDI benchmarks compare identical snapshots against 1.4.0: see **[README-OTTIMIZZAZIONI.md](README-OTTIMIZZAZIONI.md)** for measurements, fixes and reproduction commands.
+
+Open **Settings → Tools → Runtime Object to JSON** (macOS: **Preferences/Settings → Tools**) to change limits. **Ordinary values** and **Spring beans** have independent depth, items, objects, visited values, total text, string length and sparse-table/linked-node limits. **Spring lookup** controls context instances, cache entries/buckets, proxy depth and alias hops. Values are persisted across IDE restarts and apply to the next export; **Restore Defaults** restores the original budgets after Apply. Invalid or fractional input is rejected.
 
 ## One command
 
@@ -72,7 +78,7 @@ To start an interactive sandbox:
 .\gradlew.bat runIde
 ```
 
-Distribution: `ExportJson/build/distributions/PluginJson-1.4.0.zip`.
+Distribution: `ExportJson/build/distributions/PluginJson-1.5.0.zip`.
 
 Tests launch real separate JVMs, suspend them at JDI breakpoints and assert the exported data and resolution behavior. Spring tests use a real Spring Boot application. **[VERIFICA.md](VERIFICA.md)** records the checks actually performed, IDE/JDK versions and results; compatibility with every future IDE/Java/Spring version is not implied.
 

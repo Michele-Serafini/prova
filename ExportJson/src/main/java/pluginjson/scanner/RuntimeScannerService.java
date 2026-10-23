@@ -13,6 +13,7 @@ import java.util.*;
 import java.util.regex.Pattern;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import pluginjson.settings.ScanLimits;
 
 /**
  * An intentionally non-invasive snapshot of values in a suspended JVM.
@@ -30,14 +31,26 @@ public final class RuntimeScannerService {
           + "api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret).*"
   );
   private static final int BATCH_SIZE = 256;
-  private static final int MAX_STRING_LENGTH = 100_000;
-  private static final int MAX_LAYOUT_SLOTS = 100_000;
+  private static final int LAYOUT_VALUE_CACHE_SIZE = 256;
 
   private final int maxDepth;
   private final int maxItems;
   private final int maxObjects;
   private final int maxValues;
   private final int maxTextUnits;
+  private final int maxStringLength;
+  private final int maxLayoutSlots;
+  // Cache only within a suspended snapshot. Never retain JDI mirrors across
+  // resumes, exports, projects or classloaders.
+  private final Map<ReferenceType, TypeLayout> layouts = new HashMap<>();
+  private final Map<ReferenceType, Set<String>> assignableTypes = new HashMap<>();
+  private final Map<Long, Map<Field, Value>> layoutValues = new LinkedHashMap<>(32, .75f, true) {
+    @Override protected boolean removeEldestEntry(Map.Entry<Long, Map<Field, Value>> eldest) {
+      return size() > LAYOUT_VALUE_CACHE_SIZE;
+    }
+  };
+  private SpringProxyReader.ReadContext spring;
+
   private final Map<Long, String> firstPaths = new HashMap<>();
   private int objectCount;
   private int valueCount;
@@ -46,20 +59,33 @@ public final class RuntimeScannerService {
   public RuntimeScannerService() { this(false); }
 
   public RuntimeScannerService(boolean springBeanMode) {
-    maxDepth = springBeanMode ? 16 : 40;
-    maxItems = springBeanMode ? 2_000 : 10_000;
-    maxObjects = springBeanMode ? 20_000 : 50_000;
-    maxValues = springBeanMode ? 80_000 : 200_000;
-    maxTextUnits = springBeanMode ? 2_000_000 : 5_000_000;
+    this(ScanLimits.defaults(springBeanMode));
+  }
+
+  public RuntimeScannerService(@NotNull ScanLimits limits) {
+    maxDepth = limits.maxDepth();
+    maxItems = limits.maxItems();
+    maxObjects = limits.maxObjects();
+    maxValues = limits.maxValues();
+    maxTextUnits = limits.maxTextUnits();
+    maxStringLength = limits.maxStringLength();
+    maxLayoutSlots = limits.maxLayoutSlots();
   }
 
   public @NotNull JsonElement scanValue(@Nullable Value value) {
-    // A scanner can be reused without accidentally sharing references or limits.
-    firstPaths.clear();
     objectCount = 0;
     valueCount = 0;
     textUnits = 0;
-    return scan(value, 0, "#");
+    spring = new SpringProxyReader.ReadContext();
+    try {
+      return scan(value, 0, "#");
+    } finally {
+      firstPaths.clear();
+      layouts.clear();
+      assignableTypes.clear();
+      layoutValues.clear();
+      spring = null;
+    }
   }
 
   private JsonElement scan(@Nullable Value value, int depth, String path) {
@@ -75,9 +101,9 @@ public final class RuntimeScannerService {
       if (value instanceof IntegerValue v) return new JsonPrimitive(v.intValue());
       if (value instanceof LongValue v) return new JsonPrimitive(v.longValue());
       if (value instanceof FloatValue v) return Float.isFinite(v.floatValue())
-          ? new JsonPrimitive(v.floatValue()) : new JsonPrimitive(String.valueOf(v.floatValue()));
+          ? new JsonPrimitive(v.floatValue()) : stringValue(String.valueOf(v.floatValue()));
       if (value instanceof DoubleValue v) return finiteNumber(v.doubleValue());
-      if (value instanceof CharValue v) return new JsonPrimitive(String.valueOf(v.charValue()));
+      if (value instanceof CharValue v) return stringValue(String.valueOf(v.charValue()));
       if (value instanceof ObjectReference object) {
         if (isTransparentWrapper(object)) {
           Value content = object;
@@ -113,8 +139,8 @@ public final class RuntimeScannerService {
         // Unwrap at every level, including injected dependencies and proxies
         // reached through ordinary local variables. Track both proxy and target
         // IDs so cycles and shared targets retain correct JSON pointers.
-        if (SpringProxyReader.isAopProxy(object)) {
-          ObjectReference target = SpringProxyReader.singletonTarget(object);
+        if (isAssignableTo(object, "org.springframework.aop.SpringProxy")) {
+          ObjectReference target = spring.singletonTarget(object);
           if (target == null) return skipped(object.referenceType().name(),
               "Spring proxy target unavailable without invoking application code");
           return scan(target, depth + 1, path);
@@ -142,9 +168,6 @@ public final class RuntimeScannerService {
         || isAssignableTo(object, "java.lang.ClassLoader")) {
       return skipped(type, "JVM infrastructure");
     }
-
-    JsonElement scalar = scanScalar(object, type, depth, path);
-    if (scalar != null) return scalar;
 
     if (isAssignableTo(object, "java.util.Map")) return scanMap(object, depth, path);
     if (isAssignableTo(object, "java.util.Collection")) return scanCollection(object, depth, path);
@@ -190,7 +213,7 @@ public final class RuntimeScannerService {
     if (type.equals("java.util.UUID")) {
       Long msb = longField(object, "mostSigBits");
       Long lsb = longField(object, "leastSigBits");
-      if (msb != null && lsb != null) return new JsonPrimitive(new UUID(msb, lsb).toString());
+      if (msb != null && lsb != null) return stringValue(new UUID(msb, lsb).toString());
     }
     if (type.equals("java.math.BigInteger")) {
       if (textUnits >= maxTextUnits) return marker("$truncated", "Maximum snapshot text budget reached");
@@ -217,7 +240,7 @@ public final class RuntimeScannerService {
     }
     try {
       String formatted = formatDateTime(object, type);
-      if (formatted != null) return new JsonPrimitive(formatted);
+      if (formatted != null) return stringValue(formatted);
     } catch (RuntimeException ignored) {
       // A partially initialized temporal object is represented as unsupported.
     }
@@ -228,14 +251,24 @@ public final class RuntimeScannerService {
     JsonArray result = new JsonArray();
     int limit = Math.min(array.length(), maxItems);
     for (int start = 0; start < limit; start += BATCH_SIZE) {
-      int amount = Math.min(BATCH_SIZE, limit - start);
+      if (valueCount >= maxValues) {
+        result.add(marker("$truncated", "Maximum visited value count (" + maxValues + ") reached"));
+        return result;
+      }
+      int amount = Math.min(BATCH_SIZE, Math.min(limit - start, maxValues - valueCount));
       List<Value> batch = array.getValues(start, amount);
       for (int i = 0; i < batch.size(); i++) {
+        if (valueCount >= maxValues) {
+          result.add(marker("$truncated", "Maximum visited value count (" + maxValues + ") reached"));
+          return result;
+        }
         int index = start + i;
         result.add(scan(batch.get(i), depth + 1, append(path, String.valueOf(index))));
       }
     }
-    if (array.length() > limit) result.add(marker("$truncated", array.length() - limit + " more elements"));
+    if (valueCount >= maxValues && result.size() < limit) {
+      result.add(marker("$truncated", "Maximum visited value count (" + maxValues + ") reached"));
+    } else if (array.length() > limit) result.add(marker("$truncated", array.length() - limit + " more elements"));
     return result;
   }
 
@@ -248,6 +281,10 @@ public final class RuntimeScannerService {
     JsonArray result = new JsonArray();
     int size = Math.min(elements.size(), maxItems);
     for (int i = 0; i < size; i++) {
+      if (valueCount >= maxValues) {
+        result.add(marker("$truncated", "Maximum visited value count (" + maxValues + ") reached"));
+        return result;
+      }
       result.add(scan(elements.get(i), depth + 1, append(path, String.valueOf(i))));
     }
     if (elements.size() > size) result.add(marker("$truncated", collectionRemainder(actual, size)));
@@ -269,17 +306,17 @@ public final class RuntimeScannerService {
     }
     if (type.equals("java.util.ImmutableCollections$ListN")) {
       ArrayReference array = arrayField(object, "elements");
-      return array == null ? null : take(array, maxItems + 1);
+      return array == null ? null : take(array, inspectionItems() + 1);
     }
     if (type.equals("java.util.ImmutableCollections$SetN")) {
       ArrayReference array = arrayField(object, "elements");
-      if (array == null || array.length() > MAX_LAYOUT_SLOTS) return null;
+      if (array == null || array.length() > maxLayoutSlots) return null;
       List<Value> out = new ArrayList<>();
       // SetN is an open-addressed sparse table, not a compact element array.
-      for (int start = 0; start < array.length() && out.size() <= maxItems; start += BATCH_SIZE) {
+      for (int start = 0; start < array.length() && out.size() <= inspectionItems(); start += BATCH_SIZE) {
         for (Value value : array.getValues(start, Math.min(BATCH_SIZE, array.length() - start))) {
           if (value != null) out.add(value);
-          if (out.size() > maxItems) break;
+          if (out.size() > inspectionItems()) break;
         }
       }
       return out;
@@ -292,13 +329,13 @@ public final class RuntimeScannerService {
       ArrayReference storage = listStorage(root);
       if (storage != null) {
         if ((long) offset + size > storage.length()) return null;
-        return slice(storage, offset, Math.min(size, maxItems + 1));
+        return slice(storage, offset, Math.min(size, inspectionItems() + 1));
       }
       // Do not claim a complete slice when the bounded root snapshot omitted
       // data before or within this sublist.
       List<Value> items = readCollectionElements(root);
       if (items == null || (long) offset + size > items.size()) return null;
-      return new ArrayList<>(items.subList(offset, offset + Math.min(size, maxItems + 1)));
+      return new ArrayList<>(items.subList(offset, offset + Math.min(size, inspectionItems() + 1)));
     }
     if (isAssignableTo(object, "java.util.ArrayList") || type.equals("java.util.Arrays$ArrayList")
         || isAssignableTo(object, "java.util.Vector")
@@ -308,22 +345,27 @@ public final class RuntimeScannerService {
       Integer size = intField(object, "size");
       if (size == null) size = intField(object, "elementCount");
       if (size != null && (size < 0 || size > array.length())) return null;
-      return take(array, Math.min(size == null ? array.length() : size, maxItems + 1));
+      return take(array, Math.min(size == null ? array.length() : size, inspectionItems() + 1));
     }
     if (type.equals("java.util.RegularEnumSet") || type.equals("java.util.JumboEnumSet")) {
       ArrayReference universe = arrayField(object, "universe");
-      if (universe == null || universe.length() > MAX_LAYOUT_SLOTS) return null;
+      if (universe == null || universe.length() > maxLayoutSlots) return null;
       Long bits = longField(object, "elements");
       ArrayReference words = arrayField(object, "elements");
-      if (bits == null && words == null) return null;
+      if ((bits == null && words == null) || (words != null && words.length() > maxLayoutSlots)) return null;
       List<Value> out = new ArrayList<>();
-      for (int i = 0; i < universe.length() && out.size() <= maxItems; i++) {
-        Long mask = bits;
-        if (words != null) {
-          if (i / 64 >= words.length() || !(words.getValue(i / 64) instanceof LongValue word)) return null;
-          mask = word.longValue();
+      List<Value> masks = words == null ? null : slice(words, 0, words.length());
+      for (int start = 0; start < universe.length() && out.size() <= inspectionItems(); start += BATCH_SIZE) {
+        List<Value> batch = universe.getValues(start, Math.min(BATCH_SIZE, universe.length() - start));
+        for (int offset = 0; offset < batch.size() && out.size() <= inspectionItems(); offset++) {
+          int i = start + offset;
+          Long mask = bits;
+          if (masks != null) {
+            if (i / 64 >= masks.size() || !(masks.get(i / 64) instanceof LongValue word)) return null;
+            mask = word.longValue();
+          }
+          if ((mask & (1L << (i % 64))) != 0) out.add(batch.get(offset));
         }
-        if ((mask & (1L << (i % 64))) != 0) out.add(universe.getValue(i));
       }
       return out;
     }
@@ -347,21 +389,21 @@ public final class RuntimeScannerService {
       if (array == null || head == null || tail == null || array.length() == 0
           || head < 0 || tail < 0 || head >= array.length() || tail >= array.length()) return null;
       int size = (tail - head + array.length()) % array.length();
-      return circularSlice(array, head, Math.min(size, maxItems + 1));
+      return circularSlice(array, head, Math.min(size, inspectionItems() + 1));
     }
     if (type.equals("java.util.concurrent.ArrayBlockingQueue")) {
       ArrayReference array = arrayField(object, "items");
       Integer head = intField(object, "takeIndex"), count = intField(object, "count");
       if (array == null || head == null || count == null || head < 0 || head >= array.length()
           || count < 0 || count > array.length()) return null;
-      return circularSlice(array, head, Math.min(count, maxItems + 1));
+      return circularSlice(array, head, Math.min(count, inspectionItems() + 1));
     }
     if (isAssignableTo(object, "java.util.PriorityQueue")
         || type.equals("java.util.concurrent.PriorityBlockingQueue")) {
       ArrayReference array = arrayField(object, "queue");
       Integer size = intField(object, "size");
       if (array == null || size == null || size < 0 || size > array.length()) return null;
-      return take(array, Math.min(size, maxItems + 1));
+      return take(array, Math.min(size, inspectionItems() + 1));
     }
     if (isAssignableTo(object, "java.util.Set")) {
       ObjectReference map = asObject(fieldValue(object, "map"));
@@ -420,21 +462,22 @@ public final class RuntimeScannerService {
     // JSON object properties would merge those entries and lose data.
     boolean stringKeys = !isAssignableTo(actual, "java.util.IdentityHashMap");
     Set<String> keyTexts = new HashSet<>();
+    List<String> entryKeys = new ArrayList<>(entries.size());
     for (MapEntry entry : entries) {
-      if (!(entry.key() instanceof StringReference text)) { stringKeys = false; break; }
-      String key = text.value();
-      if (key.length() > MAX_STRING_LENGTH || !keyTexts.add(key)) { stringKeys = false; break; }
+      String key = entry.key() instanceof StringReference text ? text.value() : null;
+      entryKeys.add(key);
+      if (key == null || key.length() > maxStringLength || !keyTexts.add(key)) stringKeys = false;
     }
-    boolean truncated = entries.size() > maxItems;
-    int total = Math.min(entries.size(), maxItems);
+    boolean truncated = entries.size() > inspectionItems();
+    int total = Math.min(entries.size(), inspectionItems());
     // Avoid overwriting a legitimate map entry named "$truncated".
-    boolean metadataConflict = truncated && entries.stream()
-        .anyMatch(e -> e.key() instanceof StringReference s && s.value().equals("$truncated"));
+    boolean metadataConflict = truncated && keyTexts.contains("$truncated");
     if (stringKeys && !metadataConflict) {
       JsonObject result = new JsonObject();
       for (int i = 0; i < total; i++) {
+        if (valueCount >= maxValues) return appendTruncation(result, "Maximum visited value count (" + maxValues + ") reached");
         MapEntry entry = entries.get(i);
-        String key = ((StringReference) entry.key()).value();
+        String key = entryKeys.get(i);
         if (!reserveText(key.length())) return appendTruncation(result, "Maximum snapshot text budget reached while reading map keys");
         result.add(key, isSensitive(key) ? redacted()
             : scan(entry.value(), depth + 1, append(path, key)));
@@ -450,11 +493,12 @@ public final class RuntimeScannerService {
     result.add("$entries", jsonEntries);
     int i = 0;
     for (int entryIndex = 0; entryIndex < total; entryIndex++) {
+      if (valueCount >= maxValues) return appendTruncation(result, "Maximum visited value count (" + maxValues + ") reached");
       MapEntry entry = entries.get(entryIndex);
       String entryPath = append(append(path, "$entries"), String.valueOf(i++));
       JsonObject item = new JsonObject();
       item.add("key", scan(entry.key(), depth + 1, append(entryPath, "key")));
-      item.add("value", entry.key() instanceof StringReference s && isSensitive(s.value())
+      item.add("value", entryKeys.get(entryIndex) != null && isSensitive(entryKeys.get(entryIndex))
           ? redacted() : scan(entry.value(), depth + 1, append(entryPath, "value")));
       jsonEntries.add(item);
     }
@@ -479,32 +523,45 @@ public final class RuntimeScannerService {
     }
     if (type.equals("java.util.ImmutableCollections$MapN")) {
       ArrayReference table = arrayField(object, "table");
-      if (table == null || table.length() > MAX_LAYOUT_SLOTS) return null;
+      if (table == null || table.length() > maxLayoutSlots) return null;
       int length = table.length();
-      for (int i = 0; i + 1 < length && out.size() <= maxItems; i += 2) {
-        Value key = table.getValue(i);
-        if (key != null) out.add(new MapEntry(key, table.getValue(i + 1)));
+      if ((length & 1) != 0) return null;
+      for (int start = 0; start < length && out.size() <= inspectionItems(); start += BATCH_SIZE) {
+        List<Value> batch = table.getValues(start, Math.min(BATCH_SIZE, length - start));
+        for (int i = 0; i + 1 < batch.size() && out.size() <= inspectionItems(); i += 2) {
+          Value key = batch.get(i);
+          if (key != null) out.add(new MapEntry(key, batch.get(i + 1)));
+        }
       }
       return out;
     }
     if (isAssignableTo(object, "java.util.EnumMap")) {
       ArrayReference keys = arrayField(object, "keyUniverse"), values = arrayField(object, "vals");
       if (keys == null || values == null || keys.length() != values.length()
-          || keys.length() > MAX_LAYOUT_SLOTS) return null;
+          || keys.length() > maxLayoutSlots) return null;
       Value nullSentinel = staticField(object, "java.util.EnumMap", "NULL");
-      for (int i = 0; i < keys.length() && out.size() <= maxItems; i++) {
-        Value value = values.getValue(i);
-        if (value != null) out.add(new MapEntry(keys.getValue(i), value.equals(nullSentinel) ? null : value));
+      for (int start = 0; start < keys.length() && out.size() <= inspectionItems(); start += BATCH_SIZE) {
+        int count = Math.min(BATCH_SIZE, keys.length() - start);
+        List<Value> keyBatch = keys.getValues(start, count);
+        List<Value> valueBatch = values.getValues(start, count);
+        for (int i = 0; i < count && out.size() <= inspectionItems(); i++) {
+          Value value = valueBatch.get(i);
+          if (value != null) out.add(new MapEntry(keyBatch.get(i), value.equals(nullSentinel) ? null : value));
+        }
       }
       return out;
     }
     if (isAssignableTo(object, "java.util.IdentityHashMap")) {
       ArrayReference table = arrayField(object, "table");
-      if (table == null || table.length() > MAX_LAYOUT_SLOTS) return null;
+      if (table == null || table.length() > maxLayoutSlots) return null;
       Value nullSentinel = staticField(object, "java.util.IdentityHashMap", "NULL_KEY");
-      for (int i = 0; i + 1 < table.length() && out.size() <= maxItems; i += 2) {
-        Value key = table.getValue(i);
-        if (key != null) out.add(new MapEntry(key.equals(nullSentinel) ? null : key, table.getValue(i + 1)));
+      if ((table.length() & 1) != 0) return null;
+      for (int start = 0; start < table.length() && out.size() <= inspectionItems(); start += BATCH_SIZE) {
+        List<Value> batch = table.getValues(start, Math.min(BATCH_SIZE, table.length() - start));
+        for (int i = 0; i + 1 < batch.size() && out.size() <= inspectionItems(); i += 2) {
+          Value key = batch.get(i);
+          if (key != null) out.add(new MapEntry(key.equals(nullSentinel) ? null : key, batch.get(i + 1)));
+        }
       }
       return out;
     }
@@ -513,8 +570,9 @@ public final class RuntimeScannerService {
       Deque<ObjectReference> stack = new ArrayDeque<>();
       Set<Long> seen = new HashSet<>();
       ObjectReference node = asObject(fieldValue(object, "root"));
-      while ((node != null || !stack.isEmpty()) && out.size() <= maxItems) {
+      while ((node != null || !stack.isEmpty()) && out.size() <= inspectionItems()) {
         while (node != null && seen.add(node.uniqueID())) {
+          if (seen.size() > maxLayoutSlots) return null;
           stack.push(node);
           node = asObject(fieldValue(node, "left"));
         }
@@ -530,7 +588,8 @@ public final class RuntimeScannerService {
       if (head == null && Integer.valueOf(0).equals(intField(object, "size"))) return out;
       if (head != null) {
         Set<Long> seen = new HashSet<>();
-        while (head != null && seen.add(head.uniqueID()) && out.size() <= maxItems) {
+        while (head != null && seen.add(head.uniqueID()) && out.size() <= inspectionItems()) {
+          if (seen.size() > maxLayoutSlots) return null;
           out.add(new MapEntry(fieldValue(head, "key"), fieldValue(head, "value")));
           head = asObject(fieldValue(head, "after"));
         }
@@ -549,23 +608,27 @@ public final class RuntimeScannerService {
           || concurrent && fieldValue(object, "baseCount") instanceof LongValue count && count.longValue() == 0) return out;
       return null;
     }
-    if (table.length() > MAX_LAYOUT_SLOTS) return null;
+    if (table.length() > maxLayoutSlots) return null;
     Value nullSentinel = weak ? staticField(object, "java.util.WeakHashMap", "NULL_KEY") : null;
     Set<Long> seen = new HashSet<>();
     int examined = 0;
-    for (int i = 0; i < table.length() && out.size() <= maxItems; i++) {
-      ObjectReference node = asObject(table.getValue(i));
-      if (node != null && node.referenceType().name().endsWith("$ForwardingNode")) return null;
-      if (node != null && node.referenceType().name().endsWith("$TreeBin")) {
-        node = asObject(fieldValue(node, "first"));
-      }
-      while (node != null && seen.add(node.uniqueID()) && out.size() <= maxItems) {
-        if (++examined > MAX_LAYOUT_SLOTS) return null;
-        Value key = fieldValue(node, weak ? "referent" : "key");
-        // A cleared weak reference is a stale entry; NULL_KEY is a real null key.
-        if (!weak || key != null) out.add(new MapEntry(key != null && key.equals(nullSentinel) ? null : key,
-            firstPresent(node, "value", "val")));
-        node = asObject(fieldValue(node, "next"));
+    for (int start = 0; start < table.length() && out.size() <= inspectionItems(); start += BATCH_SIZE) {
+      List<Value> bucketBatch = table.getValues(start, Math.min(BATCH_SIZE, table.length() - start));
+      for (Value bucket : bucketBatch) {
+        if (out.size() > inspectionItems()) break;
+        ObjectReference node = asObject(bucket);
+        if (node != null && node.referenceType().name().endsWith("$ForwardingNode")) return null;
+        if (node != null && node.referenceType().name().endsWith("$TreeBin")) {
+          node = asObject(fieldValue(node, "first"));
+        }
+        while (node != null && seen.add(node.uniqueID()) && out.size() <= inspectionItems()) {
+          if (++examined > maxLayoutSlots) return null;
+          Value key = fieldValue(node, weak ? "referent" : "key");
+          // A cleared weak reference is a stale entry; NULL_KEY is a real null key.
+          if (!weak || key != null) out.add(new MapEntry(key != null && key.equals(nullSentinel) ? null : key,
+              firstPresent(node, "value", "val")));
+          node = asObject(fieldValue(node, "next"));
+        }
       }
     }
     return out;
@@ -609,8 +672,8 @@ public final class RuntimeScannerService {
     Set<Long> seen = new HashSet<>();
     if (skipHead && node != null) node = asObject(fieldValue(node, nextField));
     int examined = 0;
-    while (node != null && seen.add(node.uniqueID()) && result.size() <= maxItems) {
-      if (++examined > MAX_LAYOUT_SLOTS) return null;
+    while (node != null && seen.add(node.uniqueID()) && result.size() <= inspectionItems()) {
+      if (++examined > maxLayoutSlots) return null;
       Value element = fieldValue(node, elementField);
       if (element != null || !node.referenceType().name().startsWith("java.util.concurrent.")) result.add(element);
       node = asObject(fieldValue(node, nextField));
@@ -620,30 +683,46 @@ public final class RuntimeScannerService {
 
   private JsonObject scanPojo(ObjectReference object, int depth, String path) {
     JsonObject result = new JsonObject();
-    // allFields can include shadowed inherited names: qualify collisions.
-    List<Field> fields = object.referenceType().allFields();
-    Map<String, Integer> nameCount = new HashMap<>();
-    for (Field f : fields) if (!f.isStatic() && !f.isSynthetic())
-      nameCount.merge(f.name(), 1, Integer::sum);
-    for (Field field : fields) {
-      if (field.isStatic() || field.isSynthetic()) continue;
-      String name = nameCount.get(field.name()) > 1
-          ? field.declaringType().name() + "." + field.name() : field.name();
-      if (!reserveText(name.length())) return appendTruncation(result, "Maximum snapshot text budget reached while reading field names");
-      if (isSensitive(field.name())) {
-        result.add(name, redacted());
+    List<PojoField> fields = layout(object).pojoFields;
+    // Respect the visit budget before issuing a potentially wide debugger read.
+    int remaining = Math.max(0, maxValues - valueCount);
+    List<Field> requested = new ArrayList<>();
+    int plannedText = textUnits;
+    for (PojoField field : fields) {
+      if (field.name().length() > maxTextUnits - plannedText) break;
+      plannedText += field.name().length();
+      if (!field.sensitive()) {
+        if (requested.size() >= remaining) break;
+        requested.add(field.field());
+      }
+    }
+    Map<Field, Value> values = null;
+    RuntimeException batchFailure = null;
+    try {
+      if (!requested.isEmpty()) values = object.getValues(requested);
+    } catch (RuntimeException failure) {
+      batchFailure = failure;
+    }
+    for (PojoField field : fields) {
+      if (!reserveText(field.name().length())) return appendTruncation(result, "Maximum snapshot text budget reached while reading field names");
+      if (field.sensitive()) {
+        result.add(field.name(), redacted());
         continue;
       }
+      if (valueCount >= maxValues) return appendTruncation(result, "Maximum visited value count (" + maxValues + ") reached");
       try {
-        result.add(name, scan(object.getValue(field), depth + 1, append(path, name)));
+        // Recover field-level errors if a VM rejects the batch; ordinary scans
+        // need just one remote getValues call per POJO.
+        Value value = batchFailure == null ? values.get(field.field()) : object.getValue(field.field());
+        result.add(field.name(), scan(value, depth + 1, append(path, field.name())));
       } catch (RuntimeException error) {
-        result.add(name, marker("$error", error.getClass().getSimpleName() + ": " + safeMessage(error)));
+        result.add(field.name(), marker("$error", error.getClass().getSimpleName() + ": " + safeMessage(error)));
       }
     }
     return result;
   }
 
-  private static boolean isScalarType(ObjectReference object, String type) {
+  private boolean isScalarType(ObjectReference object, String type) {
     return isWrapper(type) || type.equals("java.lang.Class")
         || isAssignableTo(object, "java.lang.Enum")
         || type.equals("java.lang.StringBuilder") || type.equals("java.lang.StringBuffer")
@@ -673,64 +752,114 @@ public final class RuntimeScannerService {
     };
   }
 
-  private static boolean isAssignableTo(ObjectReference object, String desired) {
-    if (!(object.referenceType() instanceof ClassType clazz)) return false;
-    for (ClassType current = clazz; current != null; current = current.superclass())
-      if (desired.equals(current.name())) return true;
-    for (InterfaceType iface : clazz.allInterfaces()) if (desired.equals(iface.name())) return true;
-    return false;
+  private boolean isAssignableTo(ObjectReference object, String desired) {
+    ReferenceType type = object.referenceType();
+    Set<String> names = assignableTypes.get(type);
+    if (names == null) {
+      names = new HashSet<>();
+      if (type instanceof ClassType clazz) {
+        for (ClassType current = clazz; current != null; current = current.superclass()) names.add(current.name());
+        for (InterfaceType iface : clazz.allInterfaces()) names.add(iface.name());
+      } else names.add(type.name());
+      assignableTypes.put(type, names);
+    }
+    return names.contains(desired);
   }
 
-  private static @Nullable Field findField(ObjectReference object, String name) {
-    Field fallback = null;
-    for (Field field : object.referenceType().allFields()) {
-      if (field.isStatic() || !field.name().equals(name)) continue;
-      if (fallback == null) fallback = field;
-      // Layout readers must not mistake a subclass's shadow field for the
-      // private JDK storage (HashMap.table, ArrayList.size, Enum.name, etc.).
-      String declaring = field.declaringType().name();
-      if (declaring.startsWith("java.") || declaring.startsWith("jdk.")
-          || declaring.startsWith("sun.")) return field;
-    }
-    return fallback;
+  private TypeLayout layout(ObjectReference object) {
+    return layouts.computeIfAbsent(object.referenceType(), TypeLayout::new);
   }
-  private static @Nullable Value fieldValue(ObjectReference object, String name) {
+
+  private @Nullable Field findField(ObjectReference object, String name) {
+    return layout(object).byName.get(name);
+  }
+
+  private @Nullable Value fieldValue(ObjectReference object, String name) {
     if (object == null) return null;
-    Field field = findField(object, name);
-    return field == null ? null : object.getValue(field);
+    TypeLayout layout = layout(object);
+    Field field = layout.byName.get(name);
+    if (field == null) return null;
+    Map<Field, Value> values = layoutValues.get(object.uniqueID());
+    if (values == null) {
+      // One debugger round trip for the storage fields of a JDK layout node,
+      // date, wrapper, etc. A small LRU bounds retained node mirrors.
+      values = object.getValues(layout.readableFields);
+      layoutValues.put(object.uniqueID(), values);
+    }
+    return values.get(field);
   }
-  private static @Nullable Value firstPresent(ObjectReference object, String... names) {
+
+  private @Nullable Value firstPresent(ObjectReference object, String... names) {
     for (String name : names) if (findField(object, name) != null) return fieldValue(object, name);
     return null;
   }
+
+  private static final class TypeLayout {
+    final Map<String, Field> byName = new HashMap<>();
+    final List<Field> readableFields = new ArrayList<>();
+    final List<PojoField> pojoFields = new ArrayList<>();
+
+    TypeLayout(ReferenceType type) {
+      List<Field> fields = type.allFields();
+      Map<String, Integer> counts = new HashMap<>();
+      for (Field field : fields) {
+        if (field.isStatic()) continue;
+        String name = field.name();
+        Field previous = byName.get(name);
+        // Preserve the real JDK storage when user subclasses shadow a field.
+        if (previous == null || (!isJdk(previous.declaringType().name()) && isJdk(field.declaringType().name()))) {
+          byName.put(name, field);
+        }
+        if (!field.isSynthetic()) counts.merge(name, 1, Integer::sum);
+      }
+      for (Field field : byName.values()) {
+        // Layout readers need JDK storage only; do not bulk-read additional
+        // application fields from subclasses of ArrayList, Date, etc.
+        if (!isSensitive(field.name()) && isJdk(field.declaringType().name())) readableFields.add(field);
+      }
+      for (Field field : fields) {
+        if (field.isStatic() || field.isSynthetic()) continue;
+        String name = field.name();
+        pojoFields.add(new PojoField(field, counts.get(name) > 1
+            ? field.declaringType().name() + "." + name : name, isSensitive(name)));
+      }
+    }
+
+    private static boolean isJdk(String name) {
+      return name.startsWith("java.") || name.startsWith("jdk.") || name.startsWith("sun.");
+    }
+  }
+
+  private record PojoField(Field field, String name, boolean sensitive) { }
+
   private static @Nullable ObjectReference asObject(Value value) {
     return value instanceof ObjectReference object ? object : null;
   }
-  private static @Nullable ArrayReference arrayField(ObjectReference object, String name) {
+  private @Nullable ArrayReference arrayField(ObjectReference object, String name) {
     Value value = fieldValue(object, name);
     return value instanceof ArrayReference array ? array : null;
   }
-  private static @Nullable Integer intField(ObjectReference object, String name) {
+  private @Nullable Integer intField(ObjectReference object, String name) {
     Value value = fieldValue(object, name);
     if (value instanceof IntegerValue v) return v.intValue();
     if (value instanceof ShortValue v) return (int) v.shortValue();
     if (value instanceof ByteValue v) return (int) v.byteValue();
     return null;
   }
-  private static @Nullable Long longField(ObjectReference object, String name) {
+  private @Nullable Long longField(ObjectReference object, String name) {
     Value value = fieldValue(object, name);
     return value instanceof LongValue v ? v.longValue() : null;
   }
-  private static @Nullable Boolean booleanField(ObjectReference object, String name) {
+  private @Nullable Boolean booleanField(ObjectReference object, String name) {
     Value value = fieldValue(object, name);
     return value instanceof BooleanValue v ? v.booleanValue() : null;
   }
-  private static @Nullable String stringField(ObjectReference object, String name) {
+  private @Nullable String stringField(ObjectReference object, String name) {
     Value value = fieldValue(object, name);
     return value instanceof StringReference s ? s.value() : null;
   }
   private List<Value> take(ArrayReference array, int limit) {
-    return slice(array, 0, Math.min(array.length(), Math.min(limit, maxItems + 1)));
+    return slice(array, 0, Math.min(array.length(), Math.min(limit, inspectionItems() + 1)));
   }
   private static List<Value> slice(ArrayReference array, int start, int count) {
     List<Value> out = new ArrayList<>();
@@ -751,7 +880,7 @@ public final class RuntimeScannerService {
     Integer count = intField(object, "count");
     ArrayReference array = arrayField(object, "value");
     if (count == null || array == null || count < 0) return null;
-    int exported = Math.min(count, Math.min(MAX_STRING_LENGTH, Math.max(0, maxTextUnits - textUnits)));
+    int exported = Math.min(count, Math.min(maxStringLength, Math.max(0, maxTextUnits - textUnits)));
     char[] chars = new char[exported];
     String component = ((ArrayType) array.referenceType()).componentTypeName();
     if (component.equals("char")) {
@@ -809,13 +938,14 @@ public final class RuntimeScannerService {
     return false;
   }
 
-  private static @Nullable BigInteger readBigInteger(ObjectReference number) {
+  private @Nullable BigInteger readBigInteger(ObjectReference number) {
     Integer sign = intField(number, "signum");
     ArrayReference magnitude = arrayField(number, "mag");
     if (sign == null || magnitude == null || magnitude.length() > 4096) return null;
     byte[] bytes = new byte[magnitude.length() * 4];
-    for (int i = 0; i < magnitude.length(); i++) {
-      Value item = magnitude.getValue(i);
+    List<Value> parts = slice(magnitude, 0, magnitude.length());
+    for (int i = 0; i < parts.size(); i++) {
+      Value item = parts.get(i);
       if (!(item instanceof IntegerValue part)) return null;
       int n = part.intValue();
       for (int b = 0; b < 4; b++) bytes[i * 4 + b] = (byte) (n >>> (24 - b * 8));
@@ -823,7 +953,7 @@ public final class RuntimeScannerService {
     return new BigInteger(sign, bytes);
   }
 
-  private static @Nullable BigDecimal readBigDecimal(ObjectReference decimal) {
+  private @Nullable BigDecimal readBigDecimal(ObjectReference decimal) {
     Integer scale = intField(decimal, "scale");
     Long compact = longField(decimal, "intCompact");
     if (scale == null || compact == null) return null;
@@ -833,26 +963,26 @@ public final class RuntimeScannerService {
     return unscaled == null ? null : new BigDecimal(unscaled, scale);
   }
 
-  private static @Nullable LocalDate readDate(ObjectReference value) {
+  private @Nullable LocalDate readDate(ObjectReference value) {
     Integer year = intField(value, "year"), month = intField(value, "month"), day = intField(value, "day");
     return year == null || month == null || day == null ? null : LocalDate.of(year, month, day);
   }
-  private static @Nullable LocalTime readTime(ObjectReference value) {
+  private @Nullable LocalTime readTime(ObjectReference value) {
     Integer hour = intField(value, "hour"), minute = intField(value, "minute"), second = intField(value, "second"), nano = intField(value, "nano");
     return hour == null || minute == null || second == null || nano == null ? null : LocalTime.of(hour, minute, second, nano);
   }
-  private static @Nullable LocalDateTime readDateTime(ObjectReference value) {
+  private @Nullable LocalDateTime readDateTime(ObjectReference value) {
     ObjectReference date = asObject(fieldValue(value, "date"));
     ObjectReference time = asObject(fieldValue(value, "time"));
     LocalDate d = date == null ? null : readDate(date);
     LocalTime t = time == null ? null : readTime(time);
     return d == null || t == null ? null : LocalDateTime.of(d, t);
   }
-  private static @Nullable ZoneOffset readOffset(ObjectReference value) {
+  private @Nullable ZoneOffset readOffset(ObjectReference value) {
     Integer seconds = intField(value, "totalSeconds");
     return seconds == null ? null : ZoneOffset.ofTotalSeconds(seconds);
   }
-  private static @Nullable String formatDateTime(ObjectReference object, String type) {
+  private @Nullable String formatDateTime(ObjectReference object, String type) {
     switch (type) {
       case "java.time.Year" -> {
         Integer year = intField(object, "year");
@@ -927,12 +1057,12 @@ public final class RuntimeScannerService {
     }
   }
 
-  private static JsonElement finiteNumber(double value) {
+  private JsonElement finiteNumber(double value) {
     // JSON has no NaN or Infinity numeric literals.
-    return Double.isFinite(value) ? new JsonPrimitive(value) : new JsonPrimitive(String.valueOf(value));
+    return Double.isFinite(value) ? new JsonPrimitive(value) : stringValue(String.valueOf(value));
   }
   private JsonElement stringValue(String value) {
-    int exported = Math.min(value.length(), Math.min(MAX_STRING_LENGTH, Math.max(0, maxTextUnits - textUnits)));
+    int exported = Math.min(value.length(), Math.min(maxStringLength, Math.max(0, maxTextUnits - textUnits)));
     reserveText(exported);
     if (exported == value.length()) return new JsonPrimitive(value);
     JsonObject shortened = new JsonObject();
@@ -944,6 +1074,9 @@ public final class RuntimeScannerService {
   private JsonElement numericValue(Number value) {
     return reserveText(value.toString().length()) ? new JsonPrimitive(value)
         : marker("$truncated", "Maximum snapshot text budget reached");
+  }
+  private int inspectionItems() {
+    return Math.min(maxItems, Math.max(0, maxValues - valueCount));
   }
   private boolean reserveText(int count) {
     if (count > maxTextUnits - textUnits) { textUnits = maxTextUnits; return false; }
